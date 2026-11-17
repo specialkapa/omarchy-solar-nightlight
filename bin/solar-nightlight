@@ -22,6 +22,9 @@ CONFIG_DIR = Path.home() / ".config" / "solar-nightlight"
 CACHE_DIR = Path.home() / ".cache" / "solar-nightlight"
 LOCATION_CACHE_FILE = CACHE_DIR / "location.json"
 STATE_FILE = CACHE_DIR / "state.json"
+OVERRIDE_FILE = CACHE_DIR / "override.json"
+WEATHER_CACHE_FILE = CACHE_DIR / "weather.json"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
 MAX_HTTP_BYTES = 64 * 1024
 MAX_FILE_BYTES = 64 * 1024
@@ -30,6 +33,44 @@ DEFAULT_DAY_TEMP = 6500
 DEFAULT_NIGHT_TEMP = 4000
 DEFAULT_TRANSITION_MINUTES = 45
 DEFAULT_INTERVAL_SECONDS = 15
+
+# Brightness follows the sun's elevation: night level at/below LOW_ELEVATION,
+# day level at/above HIGH_ELEVATION, cosine-eased in between.
+DEFAULT_DAY_BRIGHTNESS = 100
+DEFAULT_NIGHT_BRIGHTNESS = 30
+DEFAULT_LOW_ELEVATION = -6.0     # civil twilight
+DEFAULT_HIGH_ELEVATION = 25.0
+DEFAULT_MIN_BRIGHTNESS = 5       # floor after the user offset is applied
+DEFAULT_BRIGHTNESS_STEP = 2      # don't rewrite displays for smaller changes
+MAX_OVERRIDE_MINUTES = 7 * 24 * 60
+DISPLAY_REDETECT_SECONDS = 30 * 60
+
+# Live cloud cover from Open-Meteo (keyless, HTTPS) dims the daylight part of
+# the curve: overcast removes cloud_strength of the day-night range.
+DEFAULT_CLOUD_STRENGTH = 0.4
+DEFAULT_CLOUD_REFRESH_MINUTES = 15
+CLOUD_MAX_AGE_SECONDS = 90 * 60   # older readings are ignored (treated as clear)
+
+CONFIG_KEYS = {
+    # key: (type, min, max)
+    "day_temp": (int, 1000, 20000),
+    "night_temp": (int, 1000, 20000),
+    "transition_mins": (int, 1, 600),
+    "interval": (int, 5, 3600),
+    "lat": (float, -90.0, 90.0),
+    "lon": (float, -180.0, 180.0),
+    "brightness": (bool, None, None),
+    "day_brightness": (int, 0, 100),
+    "night_brightness": (int, 0, 100),
+    "low_elevation": (float, -18.0, 60.0),
+    "high_elevation": (float, -18.0, 90.0),
+    "min_brightness": (int, 0, 100),
+    "brightness_step": (int, 1, 50),
+    "clouds": (bool, None, None),
+    "cloud_strength": (float, 0.0, 1.0),
+    "cloud_refresh_mins": (int, 5, 180),
+    "location_name": (str, 0, 60),
+}
 
 # Fallback coordinates (Central FL / default fallback if completely offline on first run)
 FALLBACK_LOCATION = {
@@ -120,63 +161,104 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
-def _ipapi_worker(q):
+# IP geolocation sources, tried in order. geo.omarchy.org is what Omarchy's own
+# weather widget uses ({"name", "latitude", "longitude"}); ipapi.co is the
+# upstream plugin's original source, kept as a fallback.
+GEO_ENDPOINTS = ("https://geo.omarchy.org/", "https://ipapi.co/json/")
+OMARCHY_WEATHER_LOCATION = Path.home() / ".local" / "state" / "omarchy" / "settings" / "weather.json"
+
+
+def _geo_worker(q, endpoint):
     import urllib.request, urllib.error, json, math, time
-    endpoint = "https://ipapi.co/json/"
     try:
         opener = urllib.request.build_opener(NoRedirectHandler())
-        req = urllib.request.Request(endpoint, headers={"User-Agent": "solar-nightlight/1.0"})
+        req = urllib.request.Request(endpoint, headers={"User-Agent": "solar-nightlight/1.1"})
         with opener.open(req, timeout=5) as resp:
             raw_bytes = resp.read(MAX_HTTP_BYTES + 1)
             if len(raw_bytes) > MAX_HTTP_BYTES: return
             data = json.loads(raw_bytes.decode("utf-8"))
-            
-            lat = float(data.get("lat") or data.get("latitude") or 0)
-            lon = float(data.get("lon") or data.get("longitude") or 0)
-            city = str(data.get("city", ""))[:50]
-            region = str(data.get("regionName", data.get("region", "")))[:50]
-            
+            if not isinstance(data, dict): return
+
+            lat_raw = data.get("lat", data.get("latitude"))
+            lon_raw = data.get("lon", data.get("longitude"))
+            if isinstance(lat_raw, bool) or isinstance(lon_raw, bool): return
+            lat = float(lat_raw)
+            lon = float(lon_raw)
+            city = str(data.get("city") or data.get("name") or "")[:50]
+            region = str(data.get("regionName") or data.get("region") or data.get("country") or "")[:50]
+
             if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
                 q.put({
-                    "lat": lat, "lon": lon, "city": city, "region": region, "timestamp": time.time()
+                    "lat": lat, "lon": lon, "city": city, "region": region,
+                    "source": endpoint, "timestamp": time.time()
                 })
     except Exception:
         pass
 
+
 def fetch_ip_location():
-    """Attempts to discover location via HTTPS geolocation service with strict 5s deadline and response caps."""
+    """Attempts each geolocation service over HTTPS with a strict 5s deadline and response caps."""
     import multiprocessing
-    q = multiprocessing.Queue()
-    p = multiprocessing.Process(target=_ipapi_worker, args=(q,))
-    p.start()
-    p.join(timeout=5.0)
-    
-    if p.is_alive():
-        p.terminate()
-        p.join(timeout=1.0)
+    for endpoint in GEO_ENDPOINTS:
+        q = multiprocessing.Queue()
+        p = multiprocessing.Process(target=_geo_worker, args=(q, endpoint))
+        p.start()
+        p.join(timeout=5.0)
+
         if p.is_alive():
-            p.kill()
-            p.join()
-            
-    if not q.empty():
-        return q.get()
+            p.terminate()
+            p.join(timeout=1.0)
+            if p.is_alive():
+                p.kill()
+                p.join()
+
+        if not q.empty():
+            return q.get()
     return None
 
 
-def get_location(override_lat=None, override_lon=None):
-    """Retrieves location from override args, cache, or auto-detection."""
+def omarchy_weather_location():
+    """Coordinates the user set for Omarchy's weather widget
+    (`omarchy-weather-location --set <name> lat,lon`), if any."""
+    try:
+        with open(OMARCHY_WEATHER_LOCATION, "rb") as fh:
+            raw = fh.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+        lat, lon = data.get("latitude"), data.get("longitude")
+        if isinstance(lat, bool) or isinstance(lon, bool):
+            return None
+        lat, lon = float(lat), float(lon)
+        if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        return {"lat": lat, "lon": lon, "city": str(data.get("name") or "")[:50],
+                "region": "Omarchy weather location", "timestamp": time.time()}
+    except Exception:
+        return None
+
+
+def get_location(override_lat=None, override_lon=None, name=None):
+    """Location, in order: config/CLI coordinates, Omarchy's weather location,
+    cached IP lookup (30 days), fresh IP lookup, stale cache, fallback."""
     if override_lat is not None and override_lon is not None:
         return {
             "lat": override_lat,
             "lon": override_lon,
-            "city": "Custom",
+            "city": name or "Custom",
             "region": "Manual Coordinates",
             "timestamp": time.time()
         }
 
-    # Check cache
+    omarchy_loc = omarchy_weather_location()
+    if omarchy_loc:
+        return omarchy_loc
+
+    # Check cache (only entries from the current set of sources)
     cached = safe_read_json(LOCATION_CACHE_FILE)
-    if cached and "lat" in cached and "lon" in cached:
+    valid_cache = isinstance(cached, dict) and "lat" in cached and "lon" in cached \
+        and cached.get("source") in GEO_ENDPOINTS
+    if valid_cache:
         cache_age = time.time() - cached.get("timestamp", 0)
         if cache_age < 30 * 86400:
             return cached
@@ -188,8 +270,7 @@ def get_location(override_lat=None, override_lon=None):
         return fresh
 
     # If offline, use cached even if old, or fallback
-    cached = safe_read_json(LOCATION_CACHE_FILE)
-    if cached and "lat" in cached and "lon" in cached:
+    if valid_cache:
         return cached
 
     return FALLBACK_LOCATION
@@ -298,6 +379,200 @@ def calculate_current_target(lat, lon, day_temp, night_temp, transition_mins, no
         return "SUNSET_TRANSITION", target, today_times
     else:
         return "NIGHT", night_temp, today_times
+
+
+def load_config():
+    """Reads ~/.config/solar-nightlight/config.json. Unknown keys and
+    out-of-range values are ignored, so a bad file never stops the daemon."""
+    try:
+        with open(CONFIG_FILE, "rb") as fh:
+            raw = fh.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            return {}
+        data = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as err:
+        print(f"[solar-nightlight] Ignoring unreadable {CONFIG_FILE}: {err}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    cfg = {}
+    for key, (kind, lo, hi) in CONFIG_KEYS.items():
+        if key not in data:
+            continue
+        value = data[key]
+        if kind is bool:
+            if isinstance(value, bool):
+                cfg[key] = value
+            continue
+        if kind is str:
+            if isinstance(value, str) and lo <= len(value) <= hi and value.isprintable():
+                cfg[key] = value
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(value):
+            continue
+        value = kind(value)
+        if lo <= value <= hi:
+            cfg[key] = value
+    return cfg
+
+
+def solar_elevation(lat, lon, dt_utc=None):
+    """Sun elevation above the horizon in degrees (NOAA approximation)."""
+    if dt_utc is None:
+        dt_utc = datetime.now(timezone.utc)
+    day_of_year = dt_utc.timetuple().tm_yday
+    gamma = 2 * math.pi / 365 * (day_of_year - 1 + (dt_utc.hour - 12) / 24)
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2 * gamma)
+        - 0.040849 * math.sin(2 * gamma)
+    )
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(gamma)
+        + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2 * gamma)
+        + 0.000907 * math.sin(2 * gamma)
+        - 0.002697 * math.cos(3 * gamma)
+        + 0.00148 * math.sin(3 * gamma)
+    )
+    minutes = dt_utc.hour * 60 + dt_utc.minute + dt_utc.second / 60
+    true_solar = minutes + eqtime + 4 * lon
+    hour_angle = math.radians(true_solar / 4 - 180)
+    lat_rad = math.radians(lat)
+    cos_zenith = (math.sin(lat_rad) * math.sin(decl)
+                  + math.cos(lat_rad) * math.cos(decl) * math.cos(hour_angle))
+    cos_zenith = max(-1.0, min(1.0, cos_zenith))
+    return 90.0 - math.degrees(math.acos(cos_zenith))
+
+
+def calculate_base_brightness(elevation, args, cloud_cover=None):
+    """Maps sun elevation to a 0-100 brightness with cosine easing. Cloud
+    cover (0-100) shrinks the daylight part of the range by up to
+    cloud_strength, so it never dims below the night level."""
+    low, high = args.low_elevation, args.high_elevation
+    if high <= low:
+        high = low + 1.0
+    progress = max(0.0, min(1.0, (elevation - low) / (high - low)))
+    weight = (1.0 - math.cos(math.pi * progress)) / 2.0
+    if cloud_cover is not None and getattr(args, "clouds", False):
+        weight *= 1.0 - args.cloud_strength * max(0.0, min(100.0, cloud_cover)) / 100.0
+    return round(args.night_brightness + weight * (args.day_brightness - args.night_brightness))
+
+
+def fetch_cloud_cover(lat, lon):
+    """Current total cloud cover in % from Open-Meteo, or None. Fixed HTTPS
+    host, no redirects, 5s timeout, 64KB response cap, value range-checked."""
+    url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=cloud_cover&timezone=UTC" % (lat, lon))
+    try:
+        opener = urllib.request.build_opener(NoRedirectHandler())
+        req = urllib.request.Request(url, headers={"User-Agent": "solar-nightlight/1.1"})
+        with opener.open(req, timeout=5) as resp:
+            raw = resp.read(MAX_HTTP_BYTES + 1)
+        if len(raw) > MAX_HTTP_BYTES:
+            return None
+        value = json.loads(raw.decode("utf-8")).get("current", {}).get("cloud_cover")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+        if not 0 <= value <= 100:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+class CloudCover:
+    """Caches the reading in weather.json so restarts don't refetch."""
+
+    def __init__(self, lat, lon, refresh_mins):
+        self.lat, self.lon = lat, lon
+        self.refresh = refresh_mins * 60
+        self.value = None
+        self.updated_at = None
+        self.last_attempt = 0.0
+        cached = safe_read_json(WEATHER_CACHE_FILE)
+        if isinstance(cached, dict):
+            v, t = cached.get("cloud_cover"), cached.get("updated_at")
+            same_place = (abs(float(cached.get("lat", 999)) - lat) < 0.05
+                          and abs(float(cached.get("lon", 999)) - lon) < 0.05) if isinstance(cached.get("lat"), (int, float)) and isinstance(cached.get("lon"), (int, float)) else False
+            if same_place and isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 100 \
+                    and isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t):
+                self.value, self.updated_at = float(v), float(t)
+
+    def current(self, now=None):
+        if now is None:
+            now = time.time()
+        due = self.updated_at is None or now - self.updated_at >= self.refresh
+        # Back off 2 minutes between failed attempts.
+        if due and now - self.last_attempt >= 120:
+            self.last_attempt = now
+            fresh = fetch_cloud_cover(self.lat, self.lon)
+            if fresh is not None:
+                if self.value is None or abs(fresh - self.value) >= 1:
+                    print(f"[solar-nightlight] Cloud cover {fresh:.0f}%")
+                self.value, self.updated_at = fresh, now
+                safe_write_json(WEATHER_CACHE_FILE, {"cloud_cover": fresh, "updated_at": now,
+                                                     "lat": self.lat, "lon": self.lon})
+        if self.updated_at is None or now - self.updated_at > CLOUD_MAX_AGE_SECONDS:
+            return None
+        return self.value
+
+
+def load_override(now=None):
+    """Returns the active brightness offset dict, or None. Expired overrides
+    are treated as absent (the daemon deletes them)."""
+    if now is None:
+        now = time.time()
+    data = safe_read_json(OVERRIDE_FILE)
+    if not isinstance(data, dict):
+        return None
+    offset = data.get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or not -100 <= offset <= 100:
+        return None
+    expires = data.get("expires_at")
+    if expires is not None:
+        if isinstance(expires, bool) or not isinstance(expires, (int, float)) or not math.isfinite(expires):
+            return None
+        if expires <= now:
+            return None
+    set_at = data.get("set_at")
+    if isinstance(set_at, bool) or not isinstance(set_at, (int, float)) or not math.isfinite(set_at):
+        set_at = None
+    return {"offset": offset, "expires_at": expires, "set_at": set_at}
+
+
+def override_mtime():
+    try:
+        return os.stat(OVERRIDE_FILE, follow_symlinks=False).st_mtime_ns
+    except OSError:
+        return None
+
+
+def clear_override():
+    try:
+        dir_fd = get_cache_dir_fd()
+    except Exception:
+        return
+    try:
+        os.unlink(OVERRIDE_FILE.name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def effective_brightness(base, override, args):
+    offset = override["offset"] if override else 0
+    return max(args.min_brightness, min(100, base + offset))
 
 
 def run_bounded(cmd, timeout=2.0, max_bytes=1024):
@@ -447,23 +722,161 @@ def load_state():
 
 
 
+# ---------------------------------------------------------------------------
+# Brightness backends: DDC/CI for external monitors, sysfs backlight (via
+# brightnessctl, which goes through logind) for the internal panel.
+# ---------------------------------------------------------------------------
+
+INTERNAL_PREFIXES = ("eDP", "LVDS", "DSI")
+
+
+def active_monitor_names():
+    code, out, _ = run_bounded(["hyprctl", "monitors", "-j"], timeout=2.0, max_bytes=256 * 1024)
+    if code != 0 or not out:
+        return None
+    try:
+        monitors = json.loads(out)
+        return sorted(str(m.get("name", ""))[:64] for m in monitors if isinstance(m, dict))
+    except Exception:
+        return None
+
+
+def detect_ddc_displays():
+    """Returns [{"bus": int, "model": str, "connector": str}] for every
+    display that answers DDC/CI. Laptop panels show as invalid and are skipped."""
+    code, out, _ = run_bounded(["ddcutil", "detect", "--brief"], timeout=30.0, max_bytes=64 * 1024)
+    if code != 0 or not out:
+        return []
+    displays = []
+    current = None
+    for line in out.splitlines():
+        stripped = line.strip()
+        if line and not line[0].isspace():
+            current = {} if stripped.startswith("Display ") else None
+            if current is not None:
+                displays.append(current)
+            continue
+        if current is None or ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        value = value.strip()
+        if key == "I2C bus" and value.startswith("/dev/i2c-") and value[9:].isdigit():
+            current["bus"] = int(value[9:])
+        elif key == "DRM connector":
+            current["connector"] = value.split("-", 1)[-1][:64]
+        elif key == "Monitor":
+            parts = value.split(":")
+            current["model"] = (parts[1] if len(parts) > 1 else value)[:64]
+    return [d for d in displays if "bus" in d]
+
+
+def backlight_device():
+    base = Path("/sys/class/backlight")
+    try:
+        devices = sorted(p.name for p in base.iterdir())
+    except OSError:
+        return None
+    return devices[0] if devices else None
+
+
+class BrightnessController:
+    def __init__(self):
+        self.ddc = []
+        self.detected_at = 0.0
+        self.monitor_names = None
+        self.last_applied = {}   # backend key -> percent
+
+    def refresh_displays(self, force=False):
+        names = active_monitor_names()
+        stale = time.time() - self.detected_at > DISPLAY_REDETECT_SECONDS
+        if force or stale or names != self.monitor_names:
+            if names != self.monitor_names:
+                self.last_applied = {}
+            self.monitor_names = names
+            self.ddc = detect_ddc_displays()
+            self.detected_at = time.time()
+            if names is not None:
+                active = set(names)
+                self.ddc = [d for d in self.ddc if not d.get("connector") or d["connector"] in active]
+            summary = ", ".join(f"{d.get('model', '?')} (bus {d['bus']})" for d in self.ddc) or "none"
+            print(f"[solar-nightlight] DDC displays: {summary}")
+
+    def internal_active(self):
+        names = self.monitor_names or []
+        return any(n.startswith(INTERNAL_PREFIXES) for n in names)
+
+    def targets(self):
+        out = [("ddc:%d" % d["bus"], d) for d in self.ddc]
+        dev = backlight_device()
+        if dev and self.internal_active():
+            out.append(("backlight:" + dev, {"backlight": dev}))
+        return out
+
+    def apply(self, percent, step):
+        """Writes percent to every display whose last value differs by >= step
+        (or always when it reaches the 0/100 ends). Returns list of keys written."""
+        written = []
+        failed = False
+        for key, target in self.targets():
+            last = self.last_applied.get(key)
+            if last is not None:
+                delta = abs(last - percent)
+                if delta == 0 or (delta < step and percent not in (0, 100)):
+                    continue
+            if "bus" in target:
+                code, _, _ = run_bounded(
+                    ["ddcutil", "--bus", str(target["bus"]), "--noverify", "setvcp", "10", str(percent)],
+                    timeout=10.0,
+                )
+            else:
+                code, _, _ = run_bounded(
+                    ["brightnessctl", "-q", "-d", target["backlight"], "set", f"{percent}%"],
+                    timeout=3.0,
+                )
+            if code == 0:
+                self.last_applied[key] = percent
+                written.append(key)
+            else:
+                failed = True
+                self.last_applied.pop(key, None)
+        if failed:
+            # A monitor may have been unplugged or re-enumerated.
+            self.detected_at = 0.0
+        return written
+
+
+def build_state(**fields):
+    fields["updated_at"] = time.time()
+    return fields
+
+
 def run_daemon(args):
-    loc = get_location(args.lat, args.lon)
+    loc = get_location(args.lat, args.lon, args.location_name)
     lat = loc["lat"]
     lon = loc["lon"]
 
     print(f"[solar-nightlight] Running with location: {loc.get('city', 'Unknown')}, {loc.get('region', '')} ({lat:.4f}, {lon:.4f})")
+    if args.brightness:
+        print(f"[solar-nightlight] Clouds: {'on' if args.clouds else 'off'} (strength {args.cloud_strength}, every {args.cloud_refresh_mins} min)")
     print(f"[solar-nightlight] Config: Day={args.day_temp}K, Night={args.night_temp}K, Transition={args.transition_mins}m, Interval={args.interval}s")
+    if args.brightness:
+        print(f"[solar-nightlight] Brightness: day={args.day_brightness}% night={args.night_brightness}% "
+              f"elevation {args.low_elevation}..{args.high_elevation} deg, floor={args.min_brightness}%")
 
     state = load_state()
     override_active = state.get("override_active", False)
     override_phase = state.get("override_phase", None)
     last_set_temp = state.get("last_set_temp", None)
+    brightness = BrightnessController()
+    clouds = CloudCover(lat, lon, args.cloud_refresh_mins) if args.brightness and args.clouds else None
+    last_override_mtime = None
+    last_effective = None
 
     while True:
         try:
             ensure_hyprsunset_running()
             now_utc = datetime.now(timezone.utc)
+            now = time.time()
             phase, target_temp, times = calculate_current_target(
                 lat, lon, args.day_temp, args.night_temp, args.transition_mins, now_utc
             )
@@ -478,59 +891,88 @@ def run_daemon(args):
                         print(f"[solar-nightlight] Detected manual override to {current_actual_temp}K (phase: {phase}). Auto-adjustment paused.")
                         override_active = True
                         override_phase = phase
-                        save_state({
-                            "override_active": True,
-                            "override_phase": phase,
-                            "last_set_temp": last_set_temp,
-                            "current_phase": phase,
-                            "target_temp": target_temp,
-                            "actual_temp": current_actual_temp,
-                            "updated_at": time.time()
-                        })
+
+            # Back on the solar target (e.g. `--force` from the panel/CLI): resume.
+            if override_active and current_actual_temp is not None and abs(current_actual_temp - target_temp) <= 80:
+                print(f"[solar-nightlight] Temperature back at solar target {target_temp}K. Resuming schedule.")
+                override_active = False
+                override_phase = None
+                last_set_temp = current_actual_temp
 
             # If override is active, check if solar phase has changed to reset it
-            if override_active:
-                if override_phase and phase != override_phase:
-                    print(f"[solar-nightlight] Phase changed from {override_phase} to {phase}. Clearing manual override.")
-                    override_active = False
-                    override_phase = None
-                    save_state({
-                        "override_active": False,
-                        "override_phase": None,
-                        "last_set_temp": last_set_temp,
-                        "current_phase": phase,
-                        "target_temp": target_temp,
-                        "actual_temp": current_actual_temp,
-                        "updated_at": time.time()
-                    })
-                else:
-                    time.sleep(args.interval)
-                    continue
+            if override_active and override_phase and phase != override_phase:
+                print(f"[solar-nightlight] Phase changed from {override_phase} to {phase}. Clearing manual override.")
+                override_active = False
+                override_phase = None
 
             # Apply target temp if needed (threshold 20K to reduce hyprctl calls during micro-steps)
-            if current_actual_temp is None or abs(current_actual_temp - target_temp) >= 20:
-                if apply_temperature(target_temp):
-                    last_set_temp = target_temp
-                    print(f"[solar-nightlight] Applied {target_temp}K (Phase: {phase})")
+            if not override_active:
+                if current_actual_temp is None or abs(current_actual_temp - target_temp) >= 20:
+                    if apply_temperature(target_temp):
+                        last_set_temp = target_temp
+                        print(f"[solar-nightlight] Applied {target_temp}K (Phase: {phase})")
 
-            save_state({
-                "override_active": override_active,
-                "override_phase": override_phase,
-                "last_set_temp": last_set_temp,
-                "current_phase": phase,
-                "target_temp": target_temp,
-                "actual_temp": current_actual_temp,
-                "updated_at": time.time()
-            })
+            # ---- Brightness ----
+            elevation = solar_elevation(lat, lon, now_utc)
+            # Clouds only matter while the sun is up; skip the fetch at night.
+            cloud_cover = clouds.current(now) if clouds and elevation > args.low_elevation else None
+            base = calculate_base_brightness(elevation, args, cloud_cover)
+            raw_override = safe_read_json(OVERRIDE_FILE)
+            override = load_override(now)
+            if raw_override is not None and override is None:
+                print("[solar-nightlight] Brightness offset expired or invalid. Removing it.")
+                clear_override()
+            target_brightness = effective_brightness(base, override, args)
+            if args.brightness:
+                brightness.refresh_displays()
+                # An explicit offset change is applied at once, regardless of step.
+                step = 1 if target_brightness != last_effective and last_override_mtime != override_mtime() else args.brightness_step
+                written = brightness.apply(target_brightness, step)
+                if written:
+                    print(f"[solar-nightlight] Brightness {target_brightness}% (base {base}%, offset {override['offset'] if override else 0:+d}, sun {elevation:.1f} deg, clouds {'n/a' if cloud_cover is None else f'{cloud_cover:.0f}%'}) -> {', '.join(written)}")
+            last_effective = target_brightness
+            last_override_mtime = override_mtime()
+
+            save_state(build_state(
+                override_active=override_active,
+                override_phase=override_phase,
+                last_set_temp=last_set_temp,
+                current_phase=phase,
+                target_temp=target_temp,
+                actual_temp=current_actual_temp,
+                day_temp=args.day_temp,
+                night_temp=args.night_temp,
+                location={"city": str(loc.get("city", ""))[:50], "region": str(loc.get("region", ""))[:50],
+                          "lat": round(lat, 4), "lon": round(lon, 4)},
+                sunrise=times["sunrise"].timestamp() if times.get("sunrise") else None,
+                sunset=times["sunset"].timestamp() if times.get("sunset") else None,
+                elevation=round(elevation, 2),
+                brightness_enabled=args.brightness,
+                base_brightness=base,
+                clouds_enabled=bool(clouds),
+                cloud_cover=cloud_cover,
+                cloud_updated_at=clouds.updated_at if clouds else None,
+                brightness_offset=override["offset"] if override else 0,
+                offset_expires_at=override["expires_at"] if override else None,
+                offset_active=override is not None,
+                brightness=target_brightness,
+                displays=[d.get("model", "?") for d in brightness.ddc]
+                         + (["Built-in"] if brightness.internal_active() and backlight_device() else []),
+            ))
 
         except Exception as err:
             print(f"[solar-nightlight] Error in loop tick: {err}", file=sys.stderr)
 
-        time.sleep(args.interval)
+        # Sleep in 1s slices so an offset set from the panel/CLI lands at once.
+        seen = override_mtime()
+        for _ in range(max(1, args.interval)):
+            time.sleep(1)
+            if override_mtime() != seen:
+                break
 
 
 def print_status(args):
-    loc = get_location(args.lat, args.lon)
+    loc = get_location(args.lat, args.lon, args.location_name)
     lat = loc["lat"]
     lon = loc["lon"]
     now_utc = datetime.now(timezone.utc)
@@ -551,6 +993,20 @@ def print_status(args):
     else:
         override_text = "Inactive"
 
+    elevation = solar_elevation(lat, lon, now_utc)
+    cloud_cover = None
+    if args.brightness and args.clouds:
+        cloud_cover = CloudCover(lat, lon, args.cloud_refresh_mins).current()
+    base = calculate_base_brightness(elevation, args, cloud_cover)
+    override = load_override()
+    if override is None:
+        offset_text = "None"
+    elif override["expires_at"] is None:
+        offset_text = f"{override['offset']:+d} pts (until cleared)"
+    else:
+        until = datetime.fromtimestamp(override["expires_at"]).strftime("%H:%M")
+        offset_text = f"{override['offset']:+d} pts (until {until})"
+
     print("--- solar-nightlight Status ---")
     print(f"Location:           {loc.get('city', 'Unknown')}, {loc.get('region', '')} ({lat:.4f}, {lon:.4f})")
     print(f"Current Local Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
@@ -559,29 +1015,102 @@ def print_status(args):
     print(f"Sunset:             {times['sunset'].astimezone(local_tz).strftime('%H:%M:%S') if times['sunset'] else 'N/A'}")
     print(f"Dusk (Civil):       {times['dusk'].astimezone(local_tz).strftime('%H:%M:%S') if times['dusk'] else 'N/A'}")
     print(f"Solar Phase:        {phase}")
+    print(f"Sun Elevation:      {elevation:.1f} deg")
     print(f"Target Temperature: {target_temp}K")
     print(f"Actual hyprsunset:  {current_actual}K" if current_actual else "Actual hyprsunset:  Not Running / Unknown")
     print(f"Manual Override:    {override_text}")
+    print(f"Brightness:         {'enabled' if args.brightness else 'disabled'}")
+    print(f"Cloud Cover:        {'off' if not args.clouds else ('n/a' if cloud_cover is None else f'{cloud_cover:.0f}%')}")
+    print(f"Solar Brightness:   {base}%")
+    print(f"Brightness Offset:  {offset_text}")
+    print(f"Target Brightness:  {effective_brightness(base, override, args)}%")
+
+
+def resolve_args(args):
+    """CLI flags win over config.json, which wins over built-in defaults."""
+    cfg = load_config()
+    defaults = {
+        "day_temp": DEFAULT_DAY_TEMP,
+        "night_temp": DEFAULT_NIGHT_TEMP,
+        "transition_mins": DEFAULT_TRANSITION_MINUTES,
+        "interval": DEFAULT_INTERVAL_SECONDS,
+        "lat": None,
+        "lon": None,
+        "brightness": True,
+        "day_brightness": DEFAULT_DAY_BRIGHTNESS,
+        "night_brightness": DEFAULT_NIGHT_BRIGHTNESS,
+        "low_elevation": DEFAULT_LOW_ELEVATION,
+        "high_elevation": DEFAULT_HIGH_ELEVATION,
+        "min_brightness": DEFAULT_MIN_BRIGHTNESS,
+        "brightness_step": DEFAULT_BRIGHTNESS_STEP,
+        "clouds": True,
+        "cloud_strength": DEFAULT_CLOUD_STRENGTH,
+        "cloud_refresh_mins": DEFAULT_CLOUD_REFRESH_MINUTES,
+        "location_name": None,
+    }
+    for key, default in defaults.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, cfg.get(key, default))
+    return args
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Astronomical solar nightlight daemon for hyprsunset")
-    parser.add_argument("--status", action="store_true", help="Show current solar times, phase, and temperature status")
-    parser.add_argument("--force", action="store_true", help="Force immediate reset of manual overrides and apply solar target")
+    parser = argparse.ArgumentParser(description="Astronomical solar nightlight + brightness daemon for Hyprland")
+    parser.add_argument("--status", action="store_true", help="Show current solar times, phase, temperature and brightness")
+    parser.add_argument("--force", action="store_true", help="Force immediate reset of manual temperature overrides and apply solar target")
     parser.add_argument("--daemon", action="store_true", help="Run in continuous background daemon mode")
-    parser.add_argument("--day-temp", type=int, default=DEFAULT_DAY_TEMP, help=f"Daytime color temperature (default: {DEFAULT_DAY_TEMP}K)")
-    parser.add_argument("--night-temp", type=int, default=DEFAULT_NIGHT_TEMP, help=f"Nighttime color temperature (default: {DEFAULT_NIGHT_TEMP}K)")
-    parser.add_argument("--transition-mins", type=int, default=DEFAULT_TRANSITION_MINUTES, help=f"Transition window in minutes (default: {DEFAULT_TRANSITION_MINUTES}m)")
-    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help=f"Check interval in seconds (default: {DEFAULT_INTERVAL_SECONDS}s)")
+    parser.add_argument("--day-temp", type=int, default=None, help=f"Daytime color temperature (default: {DEFAULT_DAY_TEMP}K)")
+    parser.add_argument("--night-temp", type=int, default=None, help=f"Nighttime color temperature (default: {DEFAULT_NIGHT_TEMP}K)")
+    parser.add_argument("--transition-mins", type=int, default=None, help=f"Transition window in minutes (default: {DEFAULT_TRANSITION_MINUTES}m)")
+    parser.add_argument("--interval", type=int, default=None, help=f"Check interval in seconds (default: {DEFAULT_INTERVAL_SECONDS}s)")
     parser.add_argument("--lat", type=float, default=None, help="Latitude override")
     parser.add_argument("--lon", type=float, default=None, help="Longitude override")
+    parser.add_argument("--no-brightness", dest="brightness", action="store_const", const=False, default=None,
+                        help="Only manage color temperature, leave display brightness alone")
+    parser.add_argument("--no-clouds", dest="clouds", action="store_const", const=False, default=None,
+                        help="Ignore live cloud cover (no Open-Meteo requests)")
+    parser.add_argument("--day-brightness", type=int, default=None, help=f"Brightness in full daylight (default: {DEFAULT_DAY_BRIGHTNESS}%%)")
+    parser.add_argument("--night-brightness", type=int, default=None, help=f"Brightness at night (default: {DEFAULT_NIGHT_BRIGHTNESS}%%)")
+    parser.add_argument("--offset", type=int, default=None, metavar="PTS",
+                        help="Set a brightness offset in percentage points (-100..100) on top of the solar brightness")
+    parser.add_argument("--for", dest="duration", type=int, default=0, metavar="MIN",
+                        help="With --offset: minutes the offset lasts (0 = until cleared)")
+    parser.add_argument("--clear-offset", action="store_true", help="Remove the brightness offset")
 
     args = parser.parse_args()
+    for name in ("low_elevation", "high_elevation", "min_brightness", "brightness_step",
+                 "cloud_strength", "cloud_refresh_mins", "location_name"):
+        setattr(args, name, None)
+    resolve_args(args)
+
+    if args.offset is not None:
+        if not -100 <= args.offset <= 100:
+            parser.error("--offset must be between -100 and 100")
+        if not 0 <= args.duration <= MAX_OVERRIDE_MINUTES:
+            parser.error(f"--for must be between 0 and {MAX_OVERRIDE_MINUTES} minutes")
+        now = time.time()
+        if args.offset == 0:
+            clear_override()
+            print("[solar-nightlight] Brightness offset cleared.")
+        else:
+            safe_write_json(OVERRIDE_FILE, {
+                "offset": args.offset,
+                "expires_at": now + args.duration * 60 if args.duration > 0 else None,
+                "set_at": now,
+            })
+            span = f"for {args.duration} min" if args.duration > 0 else "until cleared"
+            print(f"[solar-nightlight] Brightness offset {args.offset:+d} pts {span}.")
+        sys.exit(0)
+
+    if args.clear_offset:
+        clear_override()
+        print("[solar-nightlight] Brightness offset cleared.")
+        sys.exit(0)
 
     if args.force:
         save_state({})
         print("[solar-nightlight] Reset manual override. Applying current solar target...")
-        loc = get_location(args.lat, args.lon)
+        loc = get_location(args.lat, args.lon, args.location_name)
         phase, target_temp, _ = calculate_current_target(
             loc["lat"], loc["lon"], args.day_temp, args.night_temp, args.transition_mins
         )

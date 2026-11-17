@@ -1,0 +1,18 @@
+{
+  "lat": 51.4769,
+  "lon": 0.0,
+  "location_name": "Greenwich",
+  "day_temp": 6500,
+  "night_temp": 4000,
+  "transition_mins": 45,
+  "brightness": true,
+  "day_brightness": 100,
+  "night_brightness": 30,
+  "low_elevation": -6,
+  "high_elevation": 25,
+  "min_brightness": 5,
+  "brightness_step": 2,
+  "clouds": true,
+  "cloud_strength": 0.4,
+  "cloud_refresh_mins": 15
+}

@@ -1,16 +1,26 @@
 {
   "schemaVersion": 1,
-  "id": "sunshine144.solar-nightlight",
-  "name": "Solar Nightlight",
-  "version": "1.0.0",
-  "author": "sunshine144",
+  "id": "specialkapa.solar-nightlight",
+  "name": "Solar Nightlight + Brightness",
+  "version": "1.1.0",
+  "author": "specialkapa (fork of sunshine144/solar-nightlight)",
   "license": "MIT",
   "homepage": "https://github.com/sunshine144/solar-nightlight",
-  "description": "Automatically warms your screen at dusk and eases back to daylight at dawn based on real-world local sun times. Smooth, gradual transitions for zero eye strain.",
+  "description": "Warms your screen at dusk and makes display brightness follow the sun at your location, with a timed +/- brightness offset from the bar.",
   "kinds": [
-    "service"
+    "service",
+    "bar-widget"
   ],
+  "keepLoaded": true,
   "entryPoints": {
-    "service": "Service.qml"
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Solar Nightlight",
+    "description": "Solar brightness and colour temperature, with a timed brightness offset",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
   }
 }

@@ -2,6 +2,9 @@
 
 ![Solar Nightlight](preview.png)
 
+> **Fork note (specialkapa.solar-nightlight):** this fork also makes **display brightness follow the sun** at your location and adds a bar widget with a **timed brightness offset**. See [Solar brightness](#solar-brightness) below.
+
+
 > **Astronomical solar nightlight daemon for `hyprsunset` on Hyprland & Omarchy Linux.**
 
 `solar-nightlight` dynamically calculates your real-world astronomical sunrise, sunset, and civil twilight times based on your local geolocation, and smoothly eases screen color temperature between crisp daylight (`6500K`) and warm nightlight (`4000K`).
@@ -128,6 +131,54 @@ systemctl --user restart solar-nightlight
 # Stop daemon
 systemctl --user stop solar-nightlight
 ```
+
+---
+
+## Solar brightness
+
+The daemon computes the sun's elevation at your location every tick and maps it to a brightness:
+`night_brightness` at or below `low_elevation` (civil twilight, -6°), `day_brightness` at or above
+`high_elevation` (25°), cosine-eased in between. So brightness rises through the morning, peaks around
+noon (lower in winter, when the sun stays low) and falls towards dusk.
+
+It is written to:
+
+- **External monitors** over DDC/CI (`ddcutil setvcp 10`), auto-detected and re-detected when monitors change.
+- **The laptop panel** via `brightnessctl`, only while the internal display (eDP/LVDS/DSI) is enabled.
+
+**Colour temperature scale.** The panel shows a warm-to-cool bar from your night to day temperature with a marker at the current value. If you set a temperature by hand, a tick marks the solar target and a **Resume solar schedule** button appears.
+
+**Cloud cover.** While the sun is up the daemon fetches current total cloud cover for your coordinates
+from [Open-Meteo](https://open-meteo.com) (keyless, HTTPS, 5s timeout, every `cloud_refresh_mins`, default 15)
+and shrinks the daylight part of the curve by up to `cloud_strength` (default 0.4): at full overcast, midday
+brightness lands 40% of the way back towards the night level. Readings older than 90 minutes are ignored, so
+being offline just means clear-sky behaviour. Set `"clouds": false` or pass `--no-clouds` to turn it off.
+
+Displays are only rewritten when the target moves by `brightness_step` points (default 2) to spare the monitors' controllers.
+
+### Offset override
+
+Click the bar icon to open the panel: pick an offset (-50..+50 points, on top of the solar brightness),
+a duration (30m, 1h, 2h, 4h or ∞ = until cleared) and press **Apply**. The bar icon shows the active offset;
+**right-click** the icon (or press **Reset**) to clear it. The daemon picks changes up within a second.
+
+From the CLI:
+
+```bash
+solar-nightlight --offset +15 --for 60   # 15 points brighter for an hour
+solar-nightlight --offset -20            # 20 points dimmer until cleared
+solar-nightlight --clear-offset
+solar-nightlight --status
+```
+
+### Configuration
+
+Optional `~/.config/solar-nightlight/config.json` (see `config.example.json`). CLI flags win over the file.
+Location is taken from, in order: `"lat"`/`"lon"` (+ optional `"location_name"`) in this file;
+the coordinates set for Omarchy's weather widget (`omarchy-weather-location --set <name> <lat>,<lon>`);
+an IP lookup via `geo.omarchy.org` (falling back to `ipapi.co`), cached for 30 days. IP lookups are
+usually within a few tens of km, which moves sun times by a minute or two, so the config file is optional. Set `"brightness": false` (or pass `--no-brightness`) to
+manage only colour temperature. Restart the daemon after editing: `omarchy plugin disable specialkapa.solar-nightlight && omarchy plugin enable specialkapa.solar-nightlight`.
 
 ---
 
