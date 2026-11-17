@@ -5,7 +5,7 @@
   "version": "1.1.0",
   "author": "specialkapa (fork of sunshine144/solar-nightlight)",
   "license": "MIT",
-  "homepage": "https://github.com/sunshine144/solar-nightlight",
+  "homepage": "https://github.com/specialkapa/omarchy-solar-nightlight",
   "description": "Warms your screen at dusk and makes display brightness follow the sun at your location, with a timed +/- brightness offset from the bar.",
   "kinds": [
     "service",
